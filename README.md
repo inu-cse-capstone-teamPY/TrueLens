@@ -1,4 +1,4 @@
-# 🔎 Factchain (SerpAPI + OpenAI Responses API)
+# 🔎 TrueLens (SerpAPI + OpenAI Responses API)
 
 LLM과 웹 검색을 결합한 **자동 사실 검증 파이프라인** 입니다.  
 입력 텍스트에서 사실성 주장만 추출 → SerpAPI로 근거 수집 → LLM이 근거별 판정 →
