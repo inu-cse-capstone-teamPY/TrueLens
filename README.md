@@ -67,7 +67,8 @@ Step 1 → Step 2 → Step 3 → Step 4
 
 ["tech", "science", "policy", "health", "finance", "community", "general"]
 
-LLM에 아래 구조로 전달합니다.
+
+프롬프트를 LLM에 아래 구조로 전달합니다.
 $input_text 는 런타임 시 사용자가 입력한 전체 텍스트로 치환됩니다.
 
 ```text
