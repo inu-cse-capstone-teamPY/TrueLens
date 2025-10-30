@@ -55,40 +55,6 @@ Step 1 → Step 2 → Step 3 → Step 4
 | **Step 4** | `step4_score` | 휴리스틱 + LLM 판정/확신도 → **0–100 점수** 계산 | **규칙 기반 로직** |
 
 ---
-## 🧾 Step 1: LLM 주장 추출 + 주제 분류 프로픔트
-
-이 단계는 입력 문장 중 ‘사실판단’ 문장만 추출해
-검증 가능한 간단한 주장 형태로 요약하는 역할을 합니다.
-가치판단 (예: 좋다, 바람직하다) 이나 추측, 의견 등은 제외됩니다.
-
-모델은 각 주장에 대해 검색용 핵심 쿼리(normalized_query) 와
-주제(category) 를 함께 생성합니다.
-카테고리는 아래 7개 중 하나로 분류됩니다:
-
-["tech", "science", "policy", "health", "finance", "community", "general"]
-
-
-프롬프트를 LLM에 아래 구조로 전달합니다.
-$input_text 는 런타임 시 사용자가 입력한 전체 텍스트로 치환됩니다.
-
-```text
-당신은 사실검증 편집자입니다. 아래 입력 텍스트에서 "사실판단" 문장만 뽑아 간단한 주장 형태로 요약하세요.  
-가치판단(좋다/나쁘다/바람직하다 등)이나 의견/추측은 제외합니다.  
-
-또한 각 주장에 대해 주제 카테고리를 분류하세요.  
-카테고리 후보: ["tech","science","policy","health","finance","community","general"]
-
-[출력(JSON)]
-{
-  "claims": [
-    {"id": "C1", "claim": "요약 주장 한 문장", "normalized_query": "웹검색용 핵심 키워드", "category": "tech"}
-  ]
-}
-
-[입력]
-$input_text
-```
----
 
 ## 🔍 Step 2: 검색 버킷(categories)
 
