@@ -31,7 +31,7 @@
 ---------
 파이프라인 단계:
 1) step1_extract_claims  — 사실 주장 + (주제 카테고리) 추출
-2) step2_collect_evidence_serp — SerpAPI로 버킷 검색 후 병합/티어 정렬
+2) step2_collect_evidence — GOOGLE CSE API로 버킷 검색 후 병합/티어 정렬
 3) step3_evaluate_sources — LLM으로 supports/refutes/irrelevant 판정
 4) step4_score — 휴리스틱 + 판정/확신도 → 0~100 신뢰점수
 
@@ -51,6 +51,8 @@ from string import Template
 
 from dotenv import load_dotenv
 from openai import OpenAI
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 
 # ──────────────────────────────────────────────────────────────────────
 # 로깅 설정
@@ -231,6 +233,130 @@ def llm_json(client: OpenAI, prompt: str, schema_name: str, schema: Dict[str, An
 # SerpAPI 검색 어댑터 (카테고리별 쿼리 구성)
 # ──────────────────────────────────────────────────────────────────────
 
+def search_cse(category: str, query: str, max_results: int = 6, *, time_window: Optional[str] = None) -> List[Dict[str, str]]:
+    """
+    Google Custom Search JSON API 기반 검색.
+    category ∈ {"scholarly","government","news","blogs","community","general"}
+
+    - scholarly : 학술 도메인 site: 필터로 에뮬레이션
+    - government: .gov/.go.kr/.edu 등 공공/교육 필터
+    - news      : 주요 뉴스 도메인 묶음 site: 필터
+    - blogs     : 블로그 도메인 묶음
+    - community : 커뮤니티/Q&A 도메인 묶음
+    - general   : 전체 웹 (특허 도메인 제외)
+
+    time_window: {"d","w","m","y"} → CSE dateRestrict 로 매핑
+    """
+    import requests
+
+    api_key = os.getenv("GOOGLE_CSE_API_KEY")
+    cx = os.getenv("GOOGLE_CSE_CX")
+    if not api_key or not cx:
+        return []
+
+    # 특허 도메인 제외(쿼리 보강)
+    common_exclude = " -site:patents.google.com"
+
+    # 버킷별 도메인 그룹
+    SCHOLAR_SITES = [
+        "arxiv.org","acm.org","ieee.org","springer.com","sciencedirect.com",
+        "nature.com","science.org","pnas.org","cell.com","cambridge.org",
+    ]
+    NEWS_SITES = [
+        # 해외 주요
+        "reuters.com","apnews.com","bbc.com","nytimes.com","wsj.com","bloomberg.com",
+        "theguardian.com","cnn.com","cnbc.com","economist.com","washingtonpost.com",
+        # 한국 주요
+        "yna.co.kr","yonhapnews.co.kr","kbs.co.kr","mbc.co.kr","sbs.co.kr",
+        "chosun.com","joongang.co.kr","donga.com","hani.co.kr","jtbc.co.kr","mk.co.kr","edaily.co.kr",
+        "koreaherald.com","koreatimes.co.kr","asiatoday.co.kr","newsis.co.kr","heraldcorp.com",
+    ]
+    BLOG_SITES = [
+        "medium.com","tistory.com","velog.io","dev.to","blogspot.com","hashnode.com","brunch.co.kr","naver.com/blog"
+    ]
+    COMMUNITY_SITES = [
+        "reddit.com","stackoverflow.com","superuser.com","serverfault.com",
+        "quora.com","news.ycombinator.com","okky.kr","discord.com/invite"
+    ]
+
+    # 카테고리별 쿼리 강화
+    q = query
+    if category == "scholarly":
+        filt = " OR ".join(f"site:{d}" for d in SCHOLAR_SITES)
+        q = f"{query} ({filt}){common_exclude}"
+    elif category == "government":
+        filt = "(site:.gov OR site:.go.kr OR site:.g.kr OR site:.edu)"
+        q = f"{query} {filt}{common_exclude}"
+    elif category == "news":
+        filt = " OR ".join(f"site:{d}" for d in NEWS_SITES)
+        q = f"{query} ({filt}){common_exclude}"
+    elif category == "blogs":
+        filt = " OR ".join(f"site:{d}" for d in BLOG_SITES)
+        q = f"{query} ({filt}){common_exclude}"
+    elif category == "community":
+        filt = " OR ".join(f"site:{d}" for d in COMMUNITY_SITES)
+        q = f"{query} ({filt}){common_exclude}"
+    else:  # general
+        q = f"{query}{common_exclude}"
+
+    # CSE 파라미터 구성
+    # 참고: https://developers.google.com/custom-search/v1/reference/rest/v1/cse/list
+    # gl/hl과 유사한 효과는 lr=lang_ko + 쿼리/엔진 설정으로 어느정도 유도 가능
+    base_url = "https://www.googleapis.com/customsearch/v1"
+    params = {
+        "key": api_key,
+        "cx": cx,
+        "q": q,
+        "num": min(max_results, 10),   # CSE는 요청당 최대 10개
+    }
+
+    # time_window → dateRestrict 매핑 (d,w,m,y) → d1, w1, m1, y1
+    if time_window in ("d","w","m","y"):
+        params["dateRestrict"] = {"d":"d1","w":"w1","m":"m1","y":"y1"}[time_window]
+
+    results: List[Dict[str, str]] = []
+    start = 1
+    remaining = max_results
+
+    def _request(p) -> dict:
+        try:
+            r = requests.get(base_url, params=p, timeout=TIMEOUT_S)
+            r.raise_for_status()
+            return r.json()
+        except Exception:
+            return {}
+
+    while remaining > 0:
+        params["start"] = start
+        data = _request(params)
+        items = data.get("items", []) if isinstance(data, dict) else []
+        if not items:
+            break
+        for it in items:
+            results.append({
+                "title": it.get("title", ""),
+                "url": it.get("link", ""),
+                "snippet": it.get("snippet", "") or it.get("htmlSnippet",""),
+            })
+            if len(results) >= max_results:
+                break
+        if len(items) < params["num"]:
+            break
+        start += params["num"]
+        remaining = max_results - len(results)
+
+    # 중복 URL 제거
+    seen, out = set(), []
+    for r in results:
+        u = r.get("url", "")
+        if not u or u in seen:
+            continue
+        seen.add(u)
+        out.append(r)
+        if len(out) >= max_results:
+            break
+    return out
+
 def search_serpapi(category: str, query: str, max_results: int = 6) -> List[Dict[str, str]]:
     """
     category ∈ {"scholarly","government","news","blogs","community","general"}
@@ -273,6 +399,8 @@ def search_serpapi(category: str, query: str, max_results: int = 6) -> List[Dict
 
     results: List[Dict[str, str]] = []
 
+    # 	1.	scholarly → engine="google_scholar" (구글 스칼라 인덱스)
+	#   2.	news → tbm="nws" (구글 뉴스 인덱스)
     if category == "scholarly":
         # 1) 구글 스칼라 우선
         params = {"engine": "google_scholar", "q": query, "api_key": api_key, "hl": SERP_HL}
@@ -394,7 +522,7 @@ def step1_extract_claims(client: OpenAI, text: str) -> List[Dict[str, str]]:
 # ──────────────────────────────────────────────────────────────────────
 # Step 2 — 근거 수집(SerpAPI) + 정규화/티어/도메인 다양성/정렬
 # ──────────────────────────────────────────────────────────────────────
-def step2_collect_evidence_serp(
+def step2_collect_evidence(
     query: str,
     k: int = MAX_RESULTS,
     categories: Optional[List[str]] = None,   # 예: ["scholarly","government","news"]
@@ -425,17 +553,15 @@ def step2_collect_evidence_serp(
             return u
 
     def _rows_by_category(cat: str, n: int) -> List[Dict[str, str]]:
-        return search_serpapi(cat, query, max_results=n) or []
+        return search_cse(cat, query, max_results=n, time_window=time_window) or []
 
     def _rows_google(q: str, n: int) -> List[Dict[str, str]]:
-        # SerpAPI의 시간 필터(tbs)는 생략 — 간단 키워드 보강만 적용
         q2 = f"{q} -site:patents.google.com"
         if time_window in ("d","w","m","y"):
-            q2 += " "  # 필요 시 키워드 보강 지점
-        return search_serpapi("general", q2, max_results=n) or []
+            q2 += " "
+        return search_cse("general", q2, max_results=n, time_window=time_window) or []
 
     def _rows_site_sweep(domains: List[str], q: str, per_domain: int) -> List[Dict[str, str]]:
-        """여러 권위 도메인을 묶어 site: 필터로 요청 횟수를 줄이는 스윕."""
         out: List[Dict[str, str]] = []
         if not domains:
             return out
@@ -444,7 +570,7 @@ def step2_collect_evidence_serp(
             group = domains[i:i+chunk]
             filt = " OR ".join(f"site:{d}" for d in group)
             q2 = f"{q} ({filt}) -site:patents.google.com"
-            out += search_serpapi("general", q2, max_results=per_domain * len(group)) or []
+            out += search_cse("general", q2, max_results=per_domain * len(group), time_window=time_window) or []
             if len(out) >= per_domain * len(domains):
                 break
         return out
@@ -669,10 +795,48 @@ def step4_score(claim_text: str, evidences: List[Evidence], eval_out: Dict[str, 
 # 실행 루틴(파이프라인) + 콘솔 리포트 출력
 # ──────────────────────────────────────────────────────────────────────
 
+def _process_one_claim(
+    client: OpenAI,
+    claim: Dict[str, Any],
+    idx: int,
+) -> Tuple[Dict[str, Any], Dict[str, float]]:
+    """단일 주장에 대해 Step2~4를 실행하고 (assessment, timings)를 반환"""
+    timings: Dict[str, float] = {}
+
+    claim_id = claim.get("id", f"C{idx}")
+    ctext = claim.get("claim", "").strip()
+    nquery = claim.get("normalized_query", ctext)
+    claim_category = claim.get("category", "general")
+    cats_for_search = CATEGORY_PRESETS.get(claim_category, CATEGORY_PRESETS["general"])
+
+    # STEP 2 — 근거 수집
+    t2 = time.perf_counter()
+    ev = step2_collect_evidence(
+        query=nquery,
+        k=MAX_RESULTS,
+        categories=cats_for_search,
+        topic=claim_category,
+        locale="KR",
+        authority_policy="auto",
+    )
+    timings[f"{claim_id}_step2_collect"] = round(time.perf_counter() - t2, 3)
+
+    # STEP 3 — 근거 판정 (GPT 호출)
+    t3 = time.perf_counter()
+    eval_out = step3_evaluate_sources(client, ctext, ev)
+    timings[f"{claim_id}_step3_evaluate"] = round(time.perf_counter() - t3, 3)
+
+    # STEP 4 — 점수화
+    t4 = time.perf_counter()
+    assess = step4_score(ctext, ev, eval_out)
+    assess.claim_id = claim_id
+    assess.normalized_query = nquery
+    timings[f"{claim_id}_step4_score"] = round(time.perf_counter() - t4, 3)
+
+    return asdict(assess), timings
+
 def run_factchain(text: str, model: Optional[str] = None) -> Dict[str, Any]:
-    """엔드투엔드 파이프라인 실행 → JSON 리포트 반환.
-    각 단계의 소요시간은 meta.timings 에 기록.
-    """
+    """엔드투엔드 파이프라인 실행 → JSON 리포트 반환(주장 단위 병렬 처리)."""
     load_dotenv(override=True)
     client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
     if not client.api_key:
@@ -685,55 +849,63 @@ def run_factchain(text: str, model: Optional[str] = None) -> Dict[str, Any]:
     timings: Dict[str, float] = {}
     t0 = time.perf_counter()
 
-    # STEP 1 — 주장 추출
+    # STEP 1 — 주장 추출 (단일 호출; 직렬로 OK)
     t1 = time.perf_counter()
     claims = step1_extract_claims(client, text)
     timings["step1_extract_claims"] = round(time.perf_counter() - t1, 3)
 
+    # 주장별 Step2~4 병렬 처리
     assessments: List[Dict[str, Any]] = []
-    for idx, claim in enumerate(claims, start=1):
-        claim_id = claim.get("id", f"C{idx}")
-        ctext = claim.get("claim", "").strip()
-        nquery = claim.get("normalized_query", ctext)
 
-        # STEP 2 — 근거 수집
-        t2 = time.perf_counter()
-        claim_category = claim.get("category", "general")
-        cats_for_search = CATEGORY_PRESETS.get(claim_category, CATEGORY_PRESETS["general"])
-        ev = step2_collect_evidence_serp(
-            query=nquery,
-            k=MAX_RESULTS,
-            categories=cats_for_search,
-            topic=claim_category,
-            locale="KR",
-            authority_policy="auto",
-        )
-        timings[f"{claim_id}_step2_collect"] = round(time.perf_counter() - t2, 3)
+    # 병렬도는 환경/요금제(RPS, TPM)·SerpAPI 쿼터 고려해서 적절히 조절
+    max_workers = min(6, max(1, os.cpu_count() or 4))  # 예: 4~6
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = []
+        for idx, claim in enumerate(claims, start=1):
+            futures.append(ex.submit(_process_one_claim, client, claim, idx))
 
-        # STEP 3 — 근거 판정
-        t3 = time.perf_counter()
-        eval_out = step3_evaluate_sources(client, ctext, ev)
-        timings[f"{claim_id}_step3_evaluate"] = round(time.perf_counter() - t3, 3)
+        # 제출 순서가 아닌 **완료 순서**로 모으되,
+        # 출력은 원래 claim_id 순서가 필요하면 나중에 정렬
+        results = []
+        for fut in as_completed(futures):
+            try:
+                assess, tdict = fut.result()
+                results.append((assess["claim_id"], assess, tdict))
+            except Exception as e:
+                # 안전장치: 실패한 주장은 placeholder로 기록
+                cid = f"CX_{int(time.time()*1000)}"
+                results.append((cid, {
+                    "claim_id": cid,
+                    "claim_text": "<processing_failed>",
+                    "normalized_query": "",
+                    "evidence": [],
+                    "exists_evidence": False,
+                    "source_trust_summary": {"tier_counts": {"1":0,"2":0,"3":0}},
+                    "model_verdict": "uncertain",
+                    "model_confidence": 0.0,
+                    "credibility_score": 0.0,
+                }, {f"{cid}_error": 0.0}))
+                logger.exception("claim 병렬 처리 중 오류: %s", e)
 
-        # STEP 4 — 점수화
-        t4 = time.perf_counter()
-        assess = step4_score(ctext, ev, eval_out)
-        timings[f"{claim_id}_step4_score"] = round(time.perf_counter() - t4, 3)
-
-        assess.claim_id = claim_id
-        assess.normalized_query = nquery
-        assessments.append(asdict(assess))
+    # 원래 순서로 정렬(Claim ID가 C1, C2… 형태라는 가정)
+    results.sort(key=lambda x: (
+        int(x[0][1:]) if x[0].startswith("C") and x[0][1:].isdigit() else 10**9
+    ))
+    for _, assess, tdict in results:
+        assessments.append(assess)
+        timings.update(tdict)
 
     elapsed = round(time.perf_counter() - t0, 3)
     return {
         "meta": {
             "model": MODEL_DEFAULT,
-            "search_provider": "serpapi-google",
+            "search_provider": "Google Custom Search API",
             "max_results": MAX_RESULTS,
             "elapsed_sec": elapsed,
             "hl": SERP_HL,
             "gl": SERP_GL,
             "timings": timings,
+            "parallel": {"enabled": True, "max_workers": max_workers},
         },
         "claims": assessments,
     }
@@ -768,7 +940,10 @@ def tier_icons(tc: dict) -> str:
 # ──────────────────────────────────────────────────────────────────────
 
 DEMO_TEXT = """
-최근 수년간 비트코인의 시가총액은 급격히 성장하여 2021년에는 한때 1조 달러를 돌파했다. 비트코인 네트워크의 채굴 난이도와 해시레이트도 사상 최고치를 기록했으며, 대한민국은 비트코인을 법정화폐로 채택했다. 그러나 채굴 과정에서 막대한 전력이 소비되며 환경에 부정적인 영향을 미친다는 지적이 계속되고 있다. 따라서 비트코인의 채굴 방식을 지분 증명(PoS) 방식으로 전환해야 할 필요가 있다.
+아이슈타인은 1905년 특수상대성이론을 발표하여 시간과 공간의 개념을 혁신적으로 바꾸었다.  
+이 이론에 따르면 빛의 속도는 관성계에 관계없이 일정하며,  
+시간은 절대적이 아니라 관측자에 따라 상대적으로 달라진다.  
+이후 1915년 그는 일반상대성이론을 통해 중력이 시공간의 곡률로 설명될 수 있음을 제시했다.
 """
 
 """
@@ -779,6 +954,9 @@ DEMO_TEXT = """
 5) 한국은 2022년 FIFA 월드컵에서 우승했다.
 6) 수은은 상온에서 액체 상태인 유일한 금속이다.
 """
+def _phase_time(timings: dict, suffix: str) -> float:
+    vals = [v for k, v in timings.items() if k.endswith(suffix)]
+    return round(max(vals) if vals else 0.0, 3)
 
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="사실 검증 파이프라인")
@@ -809,9 +987,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     claims = report.get("claims", [])
     timings = meta.get("timings", {})
     step1_time = timings.get("step1_extract_claims", 0.0)
-    step2_time = sum(v for k, v in timings.items() if k.endswith("_step2_collect"))
-    step3_time = sum(v for k, v in timings.items() if k.endswith("_step3_evaluate"))
-    step4_time = sum(v for k, v in timings.items() if k.endswith("_step4_score"))
+    step2_time = _phase_time(timings, "_step2_collect") 
+    step3_time = _phase_time(timings, "_step3_evaluate")  
+    step4_time = _phase_time(timings, "_step4_score")
 
     print("\n[검증 결과]")
     print("───────────────────────────────")
